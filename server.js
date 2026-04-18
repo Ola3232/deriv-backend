@@ -13,19 +13,26 @@ import {
 } from "./database.js";
 
 /* ============================================================
-   SETUP
+   SETUP EXPRESS
 ============================================================ */
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Forcer les réponses en JSON même en cas d'erreur Express interne
+app.use((req, res, next) => {
+  res.setHeader("Content-Type", "application/json");
+  next();
+});
 
 /* ============================================================
    ÉTAT EN MÉMOIRE
 ============================================================ */
 const subscribedSymbols = new Set();
 const lastPrices        = {};
-let   activeSymbols     = [];   // liste complète des actifs Deriv
+let   activeSymbols     = [];   // cache des actifs Deriv
 let   ws                = null;
+let   symbolsLoaded     = false;
 
 /* ============================================================
    PUSH EXPO
@@ -34,58 +41,98 @@ async function sendPush(title, body) {
   const tokens = await getTokens();
   if (!tokens.length) return;
   const messages = tokens.map((t) => ({
-    to:       t.token,
-    sound:    "default",
-    title,
-    body,
-    priority: "high",
+    to: t.token, sound: "default", title, body, priority: "high",
   }));
   try {
     await axios.post("https://exp.host/--/api/v2/push/send", messages, {
       headers: { "Content-Type": "application/json" },
     });
   } catch (err) {
-    console.error("❌ Erreur push :", err.message);
+    console.error("❌ Push error:", err.message);
   }
 }
 
 /* ============================================================
-   DERIV WEBSOCKET — connexion principale (ticks + alertes)
+   CHARGEMENT active_symbols via WS dédié
+   On utilise une connexion WS séparée pour ne pas mélanger
+   les messages ticks et active_symbols sur la même connexion.
+============================================================ */
+function loadActiveSymbols() {
+  console.log("📋 Chargement active_symbols...");
+
+  const wsSymbols = new WebSocket(
+    "wss://ws.derivws.com/websockets/v3?app_id=1089"
+  );
+
+  const timeout = setTimeout(() => {
+    console.warn("⏱ Timeout active_symbols — retry dans 30s");
+    try { wsSymbols.terminate(); } catch {}
+    setTimeout(loadActiveSymbols, 30000);
+  }, 15000);
+
+  wsSymbols.on("open", () => {
+    wsSymbols.send(
+      JSON.stringify({ active_symbols: "brief", product_type: "basic" })
+    );
+  });
+
+  wsSymbols.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    if (!msg.active_symbols) return;
+
+    clearTimeout(timeout);
+
+    activeSymbols = msg.active_symbols
+      .filter((s) => s.symbol && s.display_name)
+      .map((s) => ({
+        symbol:         s.symbol,
+        display_name:   s.display_name,
+        market:         s.market        || "",
+        market_name:    s.market_display_name    || s.market || "Other",
+        submarket:      s.submarket     || "",
+        submarket_name: s.submarket_display_name || "",
+        is_open:        s.exchange_is_open === 1,
+      }));
+
+    symbolsLoaded = true;
+    console.log(`✅ ${activeSymbols.length} actifs chargés`);
+
+    try { wsSymbols.close(); } catch {}
+
+    // Rafraîchir toutes les 5 minutes pour tenir à jour is_open
+    setTimeout(loadActiveSymbols, 5 * 60 * 1000);
+  });
+
+  wsSymbols.on("error", (err) => {
+    clearTimeout(timeout);
+    console.error("❌ WS symbols error:", err.message);
+    setTimeout(loadActiveSymbols, 15000);
+  });
+
+  wsSymbols.on("close", () => {
+    clearTimeout(timeout);
+  });
+}
+
+/* ============================================================
+   CONNEXION DERIV WS PRINCIPALE (ticks + alertes)
 ============================================================ */
 function connectDeriv() {
-  console.log("🔌 Connexion Deriv WS...");
+  console.log("🔌 Connexion Deriv WS ticks...");
   ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
 
   ws.on("open", () => {
-    console.log("✅ Connecté à Deriv");
-    // Réabonner tous les symboles suivis
+    console.log("✅ Connecté Deriv ticks");
     for (const symbol of subscribedSymbols) {
       ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
     }
-    // Charger la liste des actifs actifs
-    ws.send(JSON.stringify({ active_symbols: "brief", product_type: "basic" }));
   });
 
   ws.on("message", async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-
-    /* ---- Liste des symboles actifs ---- */
-    if (msg.active_symbols) {
-      activeSymbols = msg.active_symbols.map((s) => ({
-        symbol:       s.symbol,
-        display_name: s.display_name,
-        market:       s.market,
-        market_name:  s.market_display_name,
-        submarket:    s.submarket,
-        submarket_name: s.submarket_display_name,
-        is_open:      s.exchange_is_open === 1,
-      }));
-      console.log(`📊 ${activeSymbols.length} actifs chargés depuis Deriv`);
-      return;
-    }
-
-    /* ---- Tick de prix ---- */
     if (!msg.tick) return;
 
     const { quote: price, symbol } = msg.tick;
@@ -106,27 +153,24 @@ function connectDeriv() {
 
       try { await markAlertFired(alert.id); } catch { continue; }
 
-      const dir      = alert.condition === "over" ? "au-dessus" : "en-dessous";
-      const pushBody = `${symbol} est passé ${dir} de ${alert.price} — Prix actuel : ${price.toFixed(4)}`;
-      console.log(`🔔 ${pushBody}`);
-      await sendPush("📈 Deriv Alert", pushBody);
+      const dir  = alert.condition === "over" ? "au-dessus" : "en-dessous";
+      const body = `${symbol} passé ${dir} de ${alert.price} — Actuel : ${price.toFixed(4)}`;
+      console.log(`🔔 ${body}`);
+      await sendPush("📈 Deriv Alert", body);
     }
   });
 
   ws.on("close", (code) => {
-    console.log(`🔄 WS fermé (${code}) — reconnexion dans 5s...`);
+    console.log(`🔄 WS ticks fermé (${code}) — reconnexion dans 5s`);
     ws = null;
     setTimeout(connectDeriv, 5000);
   });
 
   ws.on("error", (err) => {
-    console.error("❌ WS erreur :", err.message);
+    console.error("❌ WS ticks error:", err.message);
   });
 }
 
-/* ============================================================
-   ABONNEMENT SYMBOLE
-============================================================ */
 function subscribeSymbol(symbol) {
   if (subscribedSymbols.has(symbol)) return;
   subscribedSymbols.add(symbol);
@@ -140,30 +184,46 @@ function subscribeSymbol(symbol) {
    ROUTES
 ============================================================ */
 
-// Health check Render
+// Health check — DOIT retourner JSON même si le serveur démarre
 app.get("/", (req, res) => {
   res.json({
-    status:        "ok",
-    uptime:        Math.floor(process.uptime()),
-    symbols_count: activeSymbols.length,
-    subscriptions: [...subscribedSymbols],
+    status:         "ok",
+    uptime:         Math.floor(process.uptime()),
+    symbols_loaded: symbolsLoaded,
+    symbols_count:  activeSymbols.length,
+    subscriptions:  [...subscribedSymbols],
   });
 });
 
-// GET /symbols — liste complète des actifs Deriv, groupés par marché
+// GET /symbols — actifs groupés par marché
 app.get("/symbols", (req, res) => {
-  if (!activeSymbols.length) {
-    return res.status(503).json({ error: "Actifs pas encore chargés, réessaie dans quelques secondes." });
+  // Si pas encore chargé, on retourne 503 JSON (jamais HTML)
+  if (!symbolsLoaded || activeSymbols.length === 0) {
+    return res.status(503).json({
+      error:   "loading",
+      message: "Les actifs sont en cours de chargement. Réessaie dans 5 secondes.",
+    });
   }
+
+  const q       = (req.query.q || "").toLowerCase().trim();
+  const symbols = q
+    ? activeSymbols.filter(
+        (s) =>
+          s.symbol.toLowerCase().includes(q) ||
+          s.display_name.toLowerCase().includes(q) ||
+          s.market_name.toLowerCase().includes(q)
+      )
+    : activeSymbols;
 
   // Grouper par market_name
   const grouped = {};
-  for (const s of activeSymbols) {
-    if (!grouped[s.market_name]) grouped[s.market_name] = [];
-    grouped[s.market_name].push(s);
+  for (const s of symbols) {
+    const key = s.market_name || "Autres";
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(s);
   }
 
-  res.json({ total: activeSymbols.length, markets: grouped });
+  res.json({ total: symbols.length, markets: grouped });
 });
 
 // GET /alerts
@@ -198,7 +258,7 @@ app.post("/alerts", async (req, res) => {
       const dir = condition === "over" ? "au-dessus" : "en-dessous";
       return res.status(409).json({
         error:        "already_triggered",
-        message:      `Prix actuel de ${asset} (${currentPrice}) déjà ${dir} de ${numPrice}. Modifie le niveau.`,
+        message:      `Prix actuel de ${asset} (${currentPrice}) déjà ${dir} de ${numPrice}.`,
         currentPrice,
       });
     }
@@ -240,8 +300,20 @@ app.post("/save-token", async (req, res) => {
 // GET /price/:symbol
 app.get("/price/:symbol", (req, res) => {
   const price = lastPrices[req.params.symbol];
-  if (price == null) return res.status(404).json({ error: "Prix non disponible" });
+  if (price == null)
+    return res.status(404).json({ error: "Prix non disponible" });
   res.json({ symbol: req.params.symbol, price });
+});
+
+// Catch-all — toute route inconnue retourne JSON (jamais HTML 404)
+app.use((req, res) => {
+  res.status(404).json({ error: `Route inconnue : ${req.method} ${req.path}` });
+});
+
+// Gestionnaire d'erreurs Express — JSON uniquement
+app.use((err, req, res, next) => {
+  console.error("❌ Express error:", err);
+  res.status(500).json({ error: "Erreur interne du serveur" });
 });
 
 /* ============================================================
@@ -256,13 +328,15 @@ async function start() {
   }
   console.log(`📋 ${existing.length} alerte(s) en DB`);
 
+  // Lancer les deux connexions WS en parallèle
   connectDeriv();
+  loadActiveSymbols();
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
 }
 
 start().catch((err) => {
-  console.error("❌ Erreur démarrage :", err);
+  console.error("❌ Erreur démarrage:", err);
   process.exit(1);
 });
