@@ -55,7 +55,6 @@ async function sendPush(title, body, data = {}) {
         priority:  "high",
         channelId: "deriv-alerts",
         badge:     1,
-        color:     "#00C8F8",
       };
 
       console.log(`📤 Envoi push à : ${t.token.slice(0, 30)}...`);
