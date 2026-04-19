@@ -335,6 +335,18 @@ app.get("/price/:symbol", (req, res) => {
   res.json({ symbol: req.params.symbol, price });
 });
 
+// Vider tous les tokens
+app.delete("/tokens/all", async (req, res) => {
+  try {
+    const { Pool } = (await import("pg"));
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    await pool.query("DELETE FROM tokens");
+    res.json({ cleared: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Debug : voir les tokens enregistrés
 app.get("/tokens", async (req, res) => {
   try {
