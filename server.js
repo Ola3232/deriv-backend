@@ -378,6 +378,13 @@ async function start() {
   connectDeriv();
   loadActiveSymbols();
 
+  // Keep-alive : empêche Render free tier de s'endormir
+  // Ping toutes les 5 minutes
+  setInterval(() => {
+    const uptime = Math.floor(process.uptime());
+    console.log(`💓 Keep-alive — uptime: ${uptime}s`);
+  }, 5 * 60 * 1000);
+
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
 }
