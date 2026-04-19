@@ -19,7 +19,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Forcer les réponses en JSON même en cas d'erreur Express interne
 app.use((req, res, next) => {
   res.setHeader("Content-Type", "application/json");
   next();
@@ -30,32 +29,64 @@ app.use((req, res, next) => {
 ============================================================ */
 const subscribedSymbols = new Set();
 const lastPrices        = {};
-let   activeSymbols     = [];   // cache des actifs Deriv
+let   activeSymbols     = [];
 let   ws                = null;
 let   symbolsLoaded     = false;
 
 /* ============================================================
-   PUSH EXPO
+   PUSH EXPO — avec channelId Android + priorité max
 ============================================================ */
-async function sendPush(title, body) {
+async function sendPush(title, body, data = {}) {
   const tokens = await getTokens();
-  if (!tokens.length) return;
+  if (!tokens.length) {
+    console.warn("⚠️  Aucun token enregistré — push ignoré");
+    return;
+  }
+
   const messages = tokens.map((t) => ({
-    to: t.token, sound: "default", title, body, priority: "high",
+    to:           t.token,
+    sound:        "default",
+    title,
+    body,
+    data,
+    priority:     "high",          // FCM high priority (wake-lock Android)
+    channelId:    "deriv-alerts",  // doit correspondre au canal créé dans l'app
+    ttl:          60,              // expire après 60 s si non livré
+    expiration:   Math.floor(Date.now() / 1000) + 60,
+    badge:        1,
+    // Android uniquement : couleur de l'icône dans la barre de statut
+    color:        "#00C8F8",
   }));
+
   try {
-    await axios.post("https://exp.host/--/api/v2/push/send", messages, {
-      headers: { "Content-Type": "application/json" },
+    const res = await axios.post(
+      "https://exp.host/--/api/v2/push/send",
+      messages,
+      {
+        headers: {
+          "Content-Type":        "application/json",
+          "Accept":              "application/json",
+          "Accept-Encoding":     "gzip, deflate",
+        },
+      }
+    );
+
+    // Log des tickets Expo pour détecter les erreurs de livraison
+    const tickets = res.data?.data ?? [];
+    tickets.forEach((ticket, i) => {
+      if (ticket.status === "error") {
+        console.error(`❌ Push ticket[${i}] error:`, ticket.message, ticket.details);
+      } else {
+        console.log(`✅ Push ticket[${i}]: ${ticket.id}`);
+      }
     });
   } catch (err) {
-    console.error("❌ Push error:", err.message);
+    console.error("❌ Push HTTP error:", err.message);
   }
 }
 
 /* ============================================================
-   CHARGEMENT active_symbols via WS dédié
-   On utilise une connexion WS séparée pour ne pas mélanger
-   les messages ticks et active_symbols sur la même connexion.
+   CHARGEMENT active_symbols
 ============================================================ */
 function loadActiveSymbols() {
   console.log("📋 Chargement active_symbols...");
@@ -79,7 +110,6 @@ function loadActiveSymbols() {
   wsSymbols.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-
     if (!msg.active_symbols) return;
 
     clearTimeout(timeout);
@@ -100,8 +130,6 @@ function loadActiveSymbols() {
     console.log(`✅ ${activeSymbols.length} actifs chargés`);
 
     try { wsSymbols.close(); } catch {}
-
-    // Rafraîchir toutes les 5 minutes pour tenir à jour is_open
     setTimeout(loadActiveSymbols, 5 * 60 * 1000);
   });
 
@@ -117,7 +145,7 @@ function loadActiveSymbols() {
 }
 
 /* ============================================================
-   CONNEXION DERIV WS PRINCIPALE (ticks + alertes)
+   CONNEXION DERIV WS — ticks + déclenchement alertes
 ============================================================ */
 function connectDeriv() {
   console.log("🔌 Connexion Deriv WS ticks...");
@@ -151,12 +179,22 @@ function connectDeriv() {
 
       if (!triggered) continue;
 
+      // Marquer fired AVANT d'envoyer pour éviter les doublons
       try { await markAlertFired(alert.id); } catch { continue; }
 
-      const dir  = alert.condition === "over" ? "au-dessus" : "en-dessous";
-      const body = `${symbol} passé ${dir} de ${alert.price} — Actuel : ${price.toFixed(4)}`;
-      console.log(`🔔 ${body}`);
-      await sendPush("📈 Deriv Alert", body);
+      const dir  = alert.condition === "over" ? "au-dessus ↑" : "en-dessous ↓";
+      const body = `${symbol} passé ${dir} de ${alert.price}\nPrix actuel : ${price.toFixed(4)}`;
+      const title = "📈 Alerte Deriv déclenchée !";
+
+      console.log(`🔔 [ALERT #${alert.id}] ${body}`);
+
+      await sendPush(title, body, {
+        alertId:   alert.id,
+        symbol,
+        price,
+        threshold: alert.price,
+        condition: alert.condition,
+      });
     }
   });
 
@@ -183,8 +221,6 @@ function subscribeSymbol(symbol) {
 /* ============================================================
    ROUTES
 ============================================================ */
-
-// Health check — DOIT retourner JSON même si le serveur démarre
 app.get("/", (req, res) => {
   res.json({
     status:         "ok",
@@ -195,9 +231,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// GET /symbols — actifs groupés par marché
 app.get("/symbols", (req, res) => {
-  // Si pas encore chargé, on retourne 503 JSON (jamais HTML)
   if (!symbolsLoaded || activeSymbols.length === 0) {
     return res.status(503).json({
       error:   "loading",
@@ -215,7 +249,6 @@ app.get("/symbols", (req, res) => {
       )
     : activeSymbols;
 
-  // Grouper par market_name
   const grouped = {};
   for (const s of symbols) {
     const key = s.market_name || "Autres";
@@ -226,7 +259,6 @@ app.get("/symbols", (req, res) => {
   res.json({ total: symbols.length, markets: grouped });
 });
 
-// GET /alerts
 app.get("/alerts", async (req, res) => {
   try {
     res.json(await getAlerts("%"));
@@ -235,7 +267,6 @@ app.get("/alerts", async (req, res) => {
   }
 });
 
-// POST /alerts
 app.post("/alerts", async (req, res) => {
   const { asset, condition, price } = req.body;
 
@@ -272,7 +303,6 @@ app.post("/alerts", async (req, res) => {
   }
 });
 
-// DELETE /alerts/:id
 app.delete("/alerts/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: "ID invalide" });
@@ -284,20 +314,19 @@ app.delete("/alerts/:id", async (req, res) => {
   }
 });
 
-// POST /save-token
 app.post("/save-token", async (req, res) => {
   const { token } = req.body;
   if (!token || typeof token !== "string")
     return res.status(400).json({ error: "Token invalide" });
   try {
     await saveToken("default", token);
+    console.log(`📲 Token sauvegardé : ${token.slice(0, 30)}...`);
     res.json({ saved: true });
   } catch {
     res.status(500).json({ error: "Erreur base de données" });
   }
 });
 
-// GET /price/:symbol
 app.get("/price/:symbol", (req, res) => {
   const price = lastPrices[req.params.symbol];
   if (price == null)
@@ -305,12 +334,30 @@ app.get("/price/:symbol", (req, res) => {
   res.json({ symbol: req.params.symbol, price });
 });
 
-// Catch-all — toute route inconnue retourne JSON (jamais HTML 404)
+// Debug : voir les tokens enregistrés
+app.get("/tokens", async (req, res) => {
+  try {
+    const tokens = await getTokens();
+    res.json({ count: tokens.length, tokens: tokens.map(t => ({ id: t.id, user: t.user, token: t.token.slice(0, 20) + "..." })) });
+  } catch {
+    res.status(500).json({ error: "Erreur base de données" });
+  }
+});
+
+// Test push manuel : GET /test-push
+app.get("/test-push", async (req, res) => {
+  await sendPush(
+    "🧪 Test Deriv Alert",
+    "Ceci est une notification de test. Le son et la vibration fonctionnent !",
+    { test: true }
+  );
+  res.json({ sent: true });
+});
+
 app.use((req, res) => {
   res.status(404).json({ error: `Route inconnue : ${req.method} ${req.path}` });
 });
 
-// Gestionnaire d'erreurs Express — JSON uniquement
 app.use((err, req, res, next) => {
   console.error("❌ Express error:", err);
   res.status(500).json({ error: "Erreur interne du serveur" });
@@ -328,7 +375,6 @@ async function start() {
   }
   console.log(`📋 ${existing.length} alerte(s) en DB`);
 
-  // Lancer les deux connexions WS en parallèle
   connectDeriv();
   loadActiveSymbols();
 
