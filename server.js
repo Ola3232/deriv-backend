@@ -43,45 +43,46 @@ async function sendPush(title, body, data = {}) {
     return;
   }
 
-  const messages = tokens.map((t) => ({
-    to:           t.token,
-    sound:        "default",
-    title,
-    body,
-    data,
-    priority:     "high",          // FCM high priority (wake-lock Android)
-    channelId:    "deriv-alerts",  // doit correspondre au canal créé dans l'app
-    ttl:          60,              // expire après 60 s si non livré
-    expiration:   Math.floor(Date.now() / 1000) + 60,
-    badge:        1,
-    // Android uniquement : couleur de l'icône dans la barre de statut
-    color:        "#00C8F8",
-  }));
+  // Envoyer un par un pour éviter les erreurs de format tableau
+  for (const t of tokens) {
+    try {
+      const message = {
+        to:        t.token,
+        sound:     "default",
+        title,
+        body,
+        data,
+        priority:  "high",
+        channelId: "deriv-alerts",
+        badge:     1,
+        color:     "#00C8F8",
+      };
 
-  try {
-    const res = await axios.post(
-      "https://exp.host/--/api/v2/push/send",
-      messages,
-      {
-        headers: {
-          "Content-Type":        "application/json",
-          "Accept":              "application/json",
-          "Accept-Encoding":     "gzip, deflate",
-        },
-      }
-    );
+      console.log(`📤 Envoi push à : ${t.token.slice(0, 30)}...`);
 
-    // Log des tickets Expo pour détecter les erreurs de livraison
-    const tickets = res.data?.data ?? [];
-    tickets.forEach((ticket, i) => {
+      const res = await axios.post(
+        "https://exp.host/--/api/v2/push/send",
+        message,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
+          },
+        }
+      );
+
+      const ticket = res.data;
       if (ticket.status === "error") {
-        console.error(`❌ Push ticket[${i}] error:`, ticket.message, ticket.details);
+        console.error(`❌ Push ticket error:`, ticket.message, ticket.details);
       } else {
-        console.log(`✅ Push ticket[${i}]: ${ticket.id}`);
+        console.log(`✅ Push envoyé ! ticket: ${ticket.id}`);
       }
-    });
-  } catch (err) {
-    console.error("❌ Push HTTP error:", err.message);
+    } catch (err) {
+      console.error(`❌ Push HTTP error pour ${t.token.slice(0, 20)}: ${err.message}`);
+      if (err.response) {
+        console.error(`   Response: ${JSON.stringify(err.response.data)}`);
+      }
+    }
   }
 }
 
@@ -377,13 +378,6 @@ async function start() {
 
   connectDeriv();
   loadActiveSymbols();
-
-  // Keep-alive : empêche Render free tier de s'endormir
-  // Ping toutes les 5 minutes
-  setInterval(() => {
-    const uptime = Math.floor(process.uptime());
-    console.log(`💓 Keep-alive — uptime: ${uptime}s`);
-  }, 5 * 60 * 1000);
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
