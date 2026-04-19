@@ -70,11 +70,13 @@ async function sendPush(title, body, data = {}) {
         }
       );
 
-      const ticket = res.data;
+      // Expo retourne soit { status, id } soit { data: { status, id } }
+      const ticket = res.data?.data ?? res.data;
+      console.log(`📬 Réponse Expo complète:`, JSON.stringify(res.data));
       if (ticket.status === "error") {
         console.error(`❌ Push ticket error:`, ticket.message, ticket.details);
       } else {
-        console.log(`✅ Push envoyé ! ticket: ${ticket.id}`);
+        console.log(`✅ Push envoyé ! status: ${ticket.status} id: ${ticket.id}`);
       }
     } catch (err) {
       console.error(`❌ Push HTTP error pour ${t.token.slice(0, 20)}: ${err.message}`);
