@@ -36,14 +36,16 @@ let   symbolsLoaded     = false;
 /* ============================================================
    PUSH EXPO — avec channelId Android + priorité max
 ============================================================ */
-async function sendPush(title, body, data = {}) {
-  const tokens = await getTokens();
+async function sendPush(title, body, data = {}, targetUser = null) {
+  const allTokens = await getTokens();
+  const tokens = targetUser
+    ? allTokens.filter(t => t.user === targetUser)
+    : allTokens;
   if (!tokens.length) {
-    console.warn("⚠️  Aucun token enregistré — push ignoré");
+    console.warn(`⚠️  Aucun token pour user=${targetUser || "tous"} — push ignoré`);
     return;
   }
 
-  // Envoyer un par un pour éviter les erreurs de format tableau
   for (const t of tokens) {
     try {
       const message = {
@@ -56,33 +58,22 @@ async function sendPush(title, body, data = {}) {
         channelId: "deriv-alerts",
         badge:     1,
       };
-
-      console.log(`📤 Envoi push à : ${t.token.slice(0, 30)}...`);
-
+      console.log(`📤 Envoi push à user=${t.user} token=${t.token.slice(0, 25)}...`);
       const res = await axios.post(
         "https://exp.host/--/api/v2/push/send",
         message,
-        {
-          headers: {
-            "Content-Type": "application/json",
-            "Accept":       "application/json",
-          },
-        }
+        { headers: { "Content-Type": "application/json", "Accept": "application/json" } }
       );
-
-      // Expo retourne soit { status, id } soit { data: { status, id } }
       const ticket = res.data?.data ?? res.data;
-      console.log(`📬 Réponse Expo complète:`, JSON.stringify(res.data));
+      console.log(`📬 Réponse Expo:`, JSON.stringify(res.data));
       if (ticket.status === "error") {
-        console.error(`❌ Push ticket error:`, ticket.message, ticket.details);
+        console.error(`❌ Push error:`, ticket.message, ticket.details);
       } else {
-        console.log(`✅ Push envoyé ! status: ${ticket.status} id: ${ticket.id}`);
+        console.log(`✅ Push envoyé ! status=${ticket.status}`);
       }
     } catch (err) {
-      console.error(`❌ Push HTTP error pour ${t.token.slice(0, 20)}: ${err.message}`);
-      if (err.response) {
-        console.error(`   Response: ${JSON.stringify(err.response.data)}`);
-      }
+      console.error(`❌ Push HTTP error:`, err.message);
+      if (err.response) console.error(`   Response:`, JSON.stringify(err.response.data));
     }
   }
 }
@@ -196,7 +187,7 @@ function connectDeriv() {
         price,
         threshold: alert.price,
         condition: alert.condition,
-      });
+      }, alert.user);
     }
   });
 
@@ -263,7 +254,8 @@ app.get("/symbols", (req, res) => {
 
 app.get("/alerts", async (req, res) => {
   try {
-    res.json(await getAlerts("%"));
+    const user = req.query.user || "%";
+    res.json(await getAlerts(user));
   } catch {
     res.status(500).json({ error: "Erreur base de données" });
   }
@@ -298,7 +290,8 @@ app.post("/alerts", async (req, res) => {
   }
 
   try {
-    const newAlert = await addAlert({ user: "default", asset, condition, price: numPrice });
+    const user = req.body.user || "default";
+    const newAlert = await addAlert({ user, asset, condition, price: numPrice });
     res.status(201).json(newAlert);
   } catch {
     res.status(500).json({ error: "Erreur base de données" });
@@ -334,18 +327,6 @@ app.get("/price/:symbol", (req, res) => {
   if (price == null)
     return res.status(404).json({ error: "Prix non disponible" });
   res.json({ symbol: req.params.symbol, price });
-});
-
-// Vider tous les tokens
-app.delete("/tokens/all", async (req, res) => {
-  try {
-    const { Pool } = (await import("pg"));
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-    await pool.query("DELETE FROM tokens");
-    res.json({ cleared: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // Debug : voir les tokens enregistrés
@@ -391,6 +372,10 @@ async function start() {
 
   connectDeriv();
   loadActiveSymbols();
+
+  setInterval(() => {
+    console.log(`💓 Keep-alive — uptime: ${Math.floor(process.uptime())}s`);
+  }, 5 * 60 * 1000);
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
