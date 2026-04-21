@@ -12,22 +12,34 @@ export async function initDB() {
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS alerts (
-      id        SERIAL PRIMARY KEY,
-      "user"    TEXT    NOT NULL DEFAULT 'default',
-      asset     TEXT    NOT NULL,
-      condition TEXT    NOT NULL,
-      price     REAL    NOT NULL,
-      fired     INTEGER NOT NULL DEFAULT 0
+      id           SERIAL PRIMARY KEY,
+      "user"       TEXT    NOT NULL DEFAULT 'default',
+      asset        TEXT    NOT NULL,
+      condition    TEXT    NOT NULL,
+      price        REAL    NOT NULL,
+      fired        INTEGER NOT NULL DEFAULT 0,
+      fired_at     TIMESTAMPTZ,
+      fire_count   INTEGER NOT NULL DEFAULT 0,
+      last_sent_at TIMESTAMPTZ,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
 
+  await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fired_at     TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fire_count   INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tokens (
-      id    SERIAL PRIMARY KEY,
-      "user" TEXT NOT NULL DEFAULT 'default',
-      token TEXT NOT NULL UNIQUE
+      id        SERIAL PRIMARY KEY,
+      "user"    TEXT NOT NULL DEFAULT 'default',
+      token     TEXT NOT NULL UNIQUE,
+      last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  await pool.query(`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
 
   console.log("✅ Base de données PostgreSQL initialisée");
 }
@@ -58,13 +70,35 @@ export async function deleteAlert(id) {
 }
 
 export async function markAlertFired(id) {
-  return pool.query("UPDATE alerts SET fired = 1 WHERE id = $1", [id]);
+  return pool.query(
+    `UPDATE alerts
+     SET fired        = 1,
+         fired_at     = COALESCE(fired_at, NOW()),
+         fire_count   = fire_count + 1,
+         last_sent_at = NOW()
+     WHERE id = $1`,
+    [id]
+  );
+}
+
+export async function resetAlertForCooldown(id) {
+  return pool.query(`UPDATE alerts SET fired = 0 WHERE id = $1`, [id]);
+}
+
+export async function deleteOldFiredAlerts() {
+  const result = await pool.query(
+    `DELETE FROM alerts
+     WHERE fired_at IS NOT NULL
+       AND fired_at < NOW() - INTERVAL '3 days'
+     RETURNING id, "user", asset`
+  );
+  return result.rows;
 }
 
 export async function saveToken(user, token) {
   return pool.query(
-    `INSERT INTO tokens ("user", token) VALUES ($1, $2)
-     ON CONFLICT (token) DO UPDATE SET "user" = EXCLUDED."user"`,
+    `INSERT INTO tokens ("user", token, last_seen) VALUES ($1, $2, NOW())
+     ON CONFLICT (token) DO UPDATE SET "user" = EXCLUDED."user", last_seen = NOW()`,
     [user ?? "default", token]
   );
 }

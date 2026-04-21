@@ -8,17 +8,15 @@ import {
   getAlerts,
   deleteAlert,
   markAlertFired,
+  resetAlertForCooldown,
+  deleteOldFiredAlerts,
   saveToken,
   getTokens,
 } from "./database.js";
 
-/* ============================================================
-   SETUP EXPRESS
-============================================================ */
 const app = express();
 app.use(cors());
 app.use(express.json());
-
 app.use((req, res, next) => {
   res.setHeader("Content-Type", "application/json");
   next();
@@ -33,16 +31,21 @@ let   activeSymbols     = [];
 let   ws                = null;
 let   symbolsLoaded     = false;
 
+// Cooldown 2h en mémoire : alertId → timestamp dernier envoi
+const cooldownMap = new Map();
+const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 heures
+
 /* ============================================================
-   PUSH EXPO — avec channelId Android + priorité max
+   PUSH EXPO
 ============================================================ */
 async function sendPush(title, body, data = {}, targetUser = null) {
   const allTokens = await getTokens();
   const tokens = targetUser
     ? allTokens.filter(t => t.user === targetUser)
     : allTokens;
+
   if (!tokens.length) {
-    console.warn(`⚠️  Aucun token pour user=${targetUser || "tous"} — push ignoré`);
+    console.warn(`⚠️  Aucun token pour user=${targetUser || "tous"}`);
     return;
   }
 
@@ -58,18 +61,16 @@ async function sendPush(title, body, data = {}, targetUser = null) {
         channelId: "deriv-alerts",
         badge:     1,
       };
-      console.log(`📤 Envoi push à user=${t.user} token=${t.token.slice(0, 25)}...`);
       const res = await axios.post(
         "https://exp.host/--/api/v2/push/send",
         message,
         { headers: { "Content-Type": "application/json", "Accept": "application/json" } }
       );
       const ticket = res.data?.data ?? res.data;
-      console.log(`📬 Réponse Expo:`, JSON.stringify(res.data));
       if (ticket.status === "error") {
         console.error(`❌ Push error:`, ticket.message, ticket.details);
       } else {
-        console.log(`✅ Push envoyé ! status=${ticket.status}`);
+        console.log(`✅ Push envoyé à user=${targetUser} status=${ticket.status}`);
       }
     } catch (err) {
       console.error(`❌ Push HTTP error:`, err.message);
@@ -79,14 +80,11 @@ async function sendPush(title, body, data = {}, targetUser = null) {
 }
 
 /* ============================================================
-   CHARGEMENT active_symbols
+   ACTIVE SYMBOLS
 ============================================================ */
 function loadActiveSymbols() {
   console.log("📋 Chargement active_symbols...");
-
-  const wsSymbols = new WebSocket(
-    "wss://ws.derivws.com/websockets/v3?app_id=1089"
-  );
+  const wsSymbols = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
 
   const timeout = setTimeout(() => {
     console.warn("⏱ Timeout active_symbols — retry dans 30s");
@@ -95,33 +93,27 @@ function loadActiveSymbols() {
   }, 15000);
 
   wsSymbols.on("open", () => {
-    wsSymbols.send(
-      JSON.stringify({ active_symbols: "brief", product_type: "basic" })
-    );
+    wsSymbols.send(JSON.stringify({ active_symbols: "brief", product_type: "basic" }));
   });
 
   wsSymbols.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
     if (!msg.active_symbols) return;
-
     clearTimeout(timeout);
-
     activeSymbols = msg.active_symbols
-      .filter((s) => s.symbol && s.display_name)
-      .map((s) => ({
+      .filter(s => s.symbol && s.display_name)
+      .map(s => ({
         symbol:         s.symbol,
         display_name:   s.display_name,
-        market:         s.market        || "",
-        market_name:    s.market_display_name    || s.market || "Other",
-        submarket:      s.submarket     || "",
+        market:         s.market || "",
+        market_name:    s.market_display_name || s.market || "Other",
+        submarket:      s.submarket || "",
         submarket_name: s.submarket_display_name || "",
         is_open:        s.exchange_is_open === 1,
       }));
-
     symbolsLoaded = true;
     console.log(`✅ ${activeSymbols.length} actifs chargés`);
-
     try { wsSymbols.close(); } catch {}
     setTimeout(loadActiveSymbols, 5 * 60 * 1000);
   });
@@ -132,13 +124,11 @@ function loadActiveSymbols() {
     setTimeout(loadActiveSymbols, 15000);
   });
 
-  wsSymbols.on("close", () => {
-    clearTimeout(timeout);
-  });
+  wsSymbols.on("close", () => { clearTimeout(timeout); });
 }
 
 /* ============================================================
-   CONNEXION DERIV WS — ticks + déclenchement alertes
+   DERIV WS — ticks + alertes avec cooldown 2h
 ============================================================ */
 function connectDeriv() {
   console.log("🔌 Connexion Deriv WS ticks...");
@@ -164,22 +154,39 @@ function connectDeriv() {
 
     for (const alert of alerts) {
       if (alert.asset !== symbol) continue;
-      if (alert.fired === 1)      continue;
 
       const triggered =
         (alert.condition === "over"  && price >= alert.price) ||
         (alert.condition === "under" && price <= alert.price);
 
-      if (!triggered) continue;
+      if (!triggered) {
+        // Prix revenu hors zone → réarmer si en cooldown
+        if (alert.fired === 1) {
+          const lastSent = cooldownMap.get(alert.id) || 0;
+          const elapsed  = Date.now() - lastSent;
+          if (elapsed >= COOLDOWN_MS) {
+            cooldownMap.delete(alert.id);
+            await resetAlertForCooldown(alert.id).catch(() => {});
+            console.log(`🔄 Alerte #${alert.id} réarmée`);
+          }
+        }
+        continue;
+      }
 
-      // Marquer fired AVANT d'envoyer pour éviter les doublons
+      // Vérifier cooldown 2h
+      const lastSent = cooldownMap.get(alert.id) || 0;
+      const elapsed  = Date.now() - lastSent;
+      if (elapsed < COOLDOWN_MS) continue;
+
+      // Déclencher
+      cooldownMap.set(alert.id, Date.now());
       try { await markAlertFired(alert.id); } catch { continue; }
 
-      const dir  = alert.condition === "over" ? "au-dessus ↑" : "en-dessous ↓";
-      const body = `${symbol} passé ${dir} de ${alert.price}\nPrix actuel : ${price.toFixed(4)}`;
-      const title = "📈 Alerte Deriv déclenchée !";
+      const dir   = alert.condition === "over" ? "au-dessus ↑" : "en-dessous ↓";
+      const body  = `${symbol} passé ${dir} de ${alert.price}\nPrix actuel : ${price.toFixed(4)}`;
+      const title = "📈 Alerte Devises déclenchée !";
 
-      console.log(`🔔 [ALERT #${alert.id}] ${body}`);
+      console.log(`🔔 [ALERT #${alert.id} user=${alert.user} count=${(alert.fire_count || 0) + 1}] ${body}`);
 
       await sendPush(title, body, {
         alertId:   alert.id,
@@ -187,6 +194,7 @@ function connectDeriv() {
         price,
         threshold: alert.price,
         condition: alert.condition,
+        fireCount: (alert.fire_count || 0) + 1,
       }, alert.user);
     }
   });
@@ -231,24 +239,20 @@ app.get("/symbols", (req, res) => {
       message: "Les actifs sont en cours de chargement. Réessaie dans 5 secondes.",
     });
   }
-
-  const q       = (req.query.q || "").toLowerCase().trim();
+  const q = (req.query.q || "").toLowerCase().trim();
   const symbols = q
-    ? activeSymbols.filter(
-        (s) =>
-          s.symbol.toLowerCase().includes(q) ||
-          s.display_name.toLowerCase().includes(q) ||
-          s.market_name.toLowerCase().includes(q)
+    ? activeSymbols.filter(s =>
+        s.symbol.toLowerCase().includes(q) ||
+        s.display_name.toLowerCase().includes(q) ||
+        s.market_name.toLowerCase().includes(q)
       )
     : activeSymbols;
-
   const grouped = {};
   for (const s of symbols) {
     const key = s.market_name || "Autres";
     if (!grouped[key]) grouped[key] = [];
     grouped[key].push(s);
   }
-
   res.json({ total: symbols.length, markets: grouped });
 });
 
@@ -262,7 +266,7 @@ app.get("/alerts", async (req, res) => {
 });
 
 app.post("/alerts", async (req, res) => {
-  const { asset, condition, price } = req.body;
+  const { asset, condition, price, user } = req.body;
 
   if (!asset || typeof asset !== "string")
     return res.status(400).json({ error: "Actif invalide" });
@@ -290,8 +294,7 @@ app.post("/alerts", async (req, res) => {
   }
 
   try {
-    const user = req.body.user || "default";
-    const newAlert = await addAlert({ user, asset, condition, price: numPrice });
+    const newAlert = await addAlert({ user: user || "default", asset, condition, price: numPrice });
     res.status(201).json(newAlert);
   } catch {
     res.status(500).json({ error: "Erreur base de données" });
@@ -303,19 +306,21 @@ app.delete("/alerts/:id", async (req, res) => {
   if (isNaN(id)) return res.status(400).json({ error: "ID invalide" });
   try {
     await deleteAlert(id);
+    cooldownMap.delete(id);
     res.json({ deleted: true, id });
   } catch {
     res.status(500).json({ error: "Erreur base de données" });
   }
 });
 
+// CORRIGÉ : utilise le user envoyé par l'app
 app.post("/save-token", async (req, res) => {
-  const { token } = req.body;
+  const { token, user } = req.body;
   if (!token || typeof token !== "string")
     return res.status(400).json({ error: "Token invalide" });
   try {
-    await saveToken("default", token);
-    console.log(`📲 Token sauvegardé : ${token.slice(0, 30)}...`);
+    await saveToken(user || "default", token);
+    console.log(`📲 Token sauvegardé pour user=${user || "default"}`);
     res.json({ saved: true });
   } catch {
     res.status(500).json({ error: "Erreur base de données" });
@@ -329,7 +334,6 @@ app.get("/price/:symbol", (req, res) => {
   res.json({ symbol: req.params.symbol, price });
 });
 
-// Debug : voir les tokens enregistrés
 app.get("/tokens", async (req, res) => {
   try {
     const tokens = await getTokens();
@@ -339,13 +343,8 @@ app.get("/tokens", async (req, res) => {
   }
 });
 
-// Test push manuel : GET /test-push
 app.get("/test-push", async (req, res) => {
-  await sendPush(
-    "🧪 Test Deriv Alert",
-    "Ceci est une notification de test. Le son et la vibration fonctionnent !",
-    { test: true }
-  );
+  await sendPush("🧪 Test Devises Alert", "Son, vibration et barre de notif OK !", { test: true });
   res.json({ sent: true });
 });
 
@@ -359,6 +358,42 @@ app.use((err, req, res, next) => {
 });
 
 /* ============================================================
+   TÂCHES PÉRIODIQUES
+============================================================ */
+async function runPeriodicTasks() {
+  // 1. Réarmer les alertes dont le cooldown 2h est écoulé
+  try {
+    const alerts = await getAlerts("%");
+    for (const alert of alerts) {
+      if (alert.fired !== 1) continue;
+      const lastSent = cooldownMap.get(alert.id);
+      if (!lastSent) {
+        // Cooldown pas en mémoire (redémarrage serveur) → vérifier fired_at en DB
+        if (alert.last_sent_at) {
+          const elapsed = Date.now() - new Date(alert.last_sent_at).getTime();
+          if (elapsed >= COOLDOWN_MS) {
+            await resetAlertForCooldown(alert.id).catch(() => {});
+            console.log(`🔄 Alerte #${alert.id} réarmée après redémarrage`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ Erreur tâche cooldown:", err.message);
+  }
+
+  // 2. Supprimer alertes déclenchées depuis > 3 jours
+  try {
+    const deleted = await deleteOldFiredAlerts();
+    if (deleted.length > 0) {
+      console.log(`🗑️  ${deleted.length} alerte(s) supprimée(s) après 3 jours:`, deleted.map(a => `#${a.id}`).join(", "));
+    }
+  } catch (err) {
+    console.error("❌ Erreur suppression auto:", err.message);
+  }
+}
+
+/* ============================================================
    DÉMARRAGE
 ============================================================ */
 async function start() {
@@ -367,21 +402,27 @@ async function start() {
   const existing = await getAlerts("%");
   for (const a of existing) {
     if (a.fired !== 1) subscribedSymbols.add(a.asset);
+    else if (a.asset) subscribedSymbols.add(a.asset); // garder abonnement pour réarmement
   }
   console.log(`📋 ${existing.length} alerte(s) en DB`);
 
   connectDeriv();
   loadActiveSymbols();
 
+  // Keep-alive toutes les 5 min
   setInterval(() => {
     console.log(`💓 Keep-alive — uptime: ${Math.floor(process.uptime())}s`);
   }, 5 * 60 * 1000);
+
+  // Tâches périodiques toutes les 10 min
+  setInterval(runPeriodicTasks, 10 * 60 * 1000);
+  runPeriodicTasks(); // exécuter au démarrage
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
 }
 
-start().catch((err) => {
+start().catch(err => {
   console.error("❌ Erreur démarrage:", err);
   process.exit(1);
 });
