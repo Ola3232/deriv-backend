@@ -41,6 +41,24 @@ export async function initDB() {
 
   await pool.query(`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS invite_codes (
+      id         SERIAL PRIMARY KEY,
+      code       TEXT    NOT NULL UNIQUE,
+      role       TEXT    NOT NULL DEFAULT 'user',
+      used       INTEGER NOT NULL DEFAULT 0,
+      used_by    TEXT,
+      used_at    TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO invite_codes (code, role)
+    VALUES ('ADMIN-SADATH2024', 'admin')
+    ON CONFLICT (code) DO NOTHING
+  `);
+
   console.log("✅ Base de données PostgreSQL initialisée");
 }
 
@@ -105,5 +123,49 @@ export async function saveToken(user, token) {
 
 export async function getTokens() {
   const result = await pool.query("SELECT * FROM tokens");
+  return result.rows;
+}
+
+/* ============================================================
+   INVITE CODES
+============================================================ */
+export async function validateCode(code) {
+  const result = await pool.query(
+    `SELECT * FROM invite_codes WHERE code = $1`,
+    [code.toUpperCase().trim()]
+  );
+  if (!result.rows.length) return { valid: false, reason: "Code invalide" };
+  const row = result.rows[0];
+  if (row.used === 1 && row.role !== 'admin')
+    return { valid: false, reason: "Code déjà utilisé" };
+  return { valid: true, role: row.role, code: row.code };
+}
+
+export async function markCodeUsed(code, userId) {
+  return pool.query(
+    `UPDATE invite_codes SET used = 1, used_by = $1, used_at = NOW()
+     WHERE code = $2 AND role != 'admin'`,
+    [userId, code.toUpperCase().trim()]
+  );
+}
+
+export async function generateCode(role = 'user') {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const random = Array.from({length: 6}, () =>
+    chars[Math.floor(Math.random() * chars.length)]
+  ).join('');
+  const prefix = role === 'admin' ? 'ADMIN' : 'USER';
+  const code = `${prefix}-${random}`;
+  await pool.query(
+    `INSERT INTO invite_codes (code, role) VALUES ($1, $2)`,
+    [code, role]
+  );
+  return code;
+}
+
+export async function getCodes() {
+  const result = await pool.query(
+    `SELECT * FROM invite_codes ORDER BY created_at DESC`
+  );
   return result.rows;
 }
