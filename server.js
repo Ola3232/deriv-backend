@@ -34,7 +34,7 @@ let   symbolsLoaded     = false;
 const cooldownMap       = new Map();
 const COOLDOWN_MS       = 2 * 60 * 60 * 1000;
 
-async function sendPush(title, body, data = {}, targetUser = null) {
+async function sendPush(title, body, data = {}, targetUser = null, channelId = "deriv-alerts-trading") {
   const allTokens = await getTokens();
   const tokens = targetUser
     ? allTokens.filter(t => t.user === targetUser)
@@ -45,7 +45,7 @@ async function sendPush(title, body, data = {}, targetUser = null) {
   }
   for (const t of tokens) {
     try {
-      const message = { to: t.token, sound: "default", title, body, data, priority: "high", channelId: "deriv-alerts", badge: 1 };
+      const message = { to: t.token, sound: "default", title, body, data, priority: "high", channelId, badge: 1 };
       const res = await axios.post("https://exp.host/--/api/v2/push/send", message,
         { headers: { "Content-Type": "application/json", "Accept": "application/json" } });
       const ticket = res.data?.data ?? res.data;
@@ -113,9 +113,27 @@ function connectDeriv() {
       cooldownMap.set(alert.id, Date.now());
       try { await markAlertFired(alert.id); } catch { continue; }
       const dir  = alert.condition === "over" ? "au-dessus ↑" : "en-dessous ↓";
-      const body = `${symbol} passé ${dir} de ${alert.price}\nPrix actuel : ${price.toFixed(4)}`;
+      const type = alert.alert_type || "alert";
+      const titleMap  = { alert: "🔔 Alerte déclenchée !", tp: "✅ Take Profit atteint !", sl: "🛑 Stop Loss atteint !" };
+      const prefixMap = { alert: "Niveau atteint", tp: "TP touché", sl: "SL touché" };
+      const notifTitle = titleMap[type]  || titleMap.alert;
+      const prefix     = prefixMap[type] || prefixMap.alert;
+      const body = `${prefix} — ${symbol} ${dir} de ${alert.price}\nPrix actuel : ${price.toFixed(4)}`;
       console.log(`🔔 [ALERT #${alert.id} user=${alert.user}] ${body}`);
-      await sendPush("📈 Alerte Devises déclenchée !", body, { alertId: alert.id, symbol, price, threshold: alert.price, condition: alert.condition }, alert.user);
+      const soundChannel = {
+        trading: "deriv-alerts-trading",
+        alarm:   "deriv-alerts-alarm",
+        pulse:   "deriv-alerts-pulse",
+      }[alert.sound || "trading"] || "deriv-alerts-trading";
+
+      await sendPush(notifTitle, body, {
+        alertId:   alert.id,
+        symbol,
+        price,
+        threshold: alert.price,
+        condition: alert.condition,
+        sound:     alert.sound || "trading",
+      }, alert.user, soundChannel);
     }
   });
   ws.on("close", (code) => { ws = null; setTimeout(connectDeriv, 5000); });
@@ -156,7 +174,11 @@ app.post("/alerts", async (req, res) => {
     const already = (condition === "over" && currentPrice >= numPrice) || (condition === "under" && currentPrice <= numPrice);
     if (already) return res.status(409).json({ error: "already_triggered", message: `Prix actuel de ${asset} (${currentPrice}) déjà ${condition === "over" ? "au-dessus" : "en-dessous"} de ${numPrice}.`, currentPrice });
   }
-  try { res.status(201).json(await addAlert({ user: user || "default", asset, condition, price: numPrice })); }
+  try {
+    const sound     = req.body.sound     || "trading";
+    const alertType = req.body.alertType || "alert";
+    res.status(201).json(await addAlert({ user: user || "default", asset, condition, price: numPrice, sound, alertType }));
+  }
   catch { res.status(500).json({ error: "Erreur base de données" }); }
 });
 

@@ -21,11 +21,15 @@ export async function initDB() {
       fired_at     TIMESTAMPTZ,
       fire_count   INTEGER NOT NULL DEFAULT 0,
       last_sent_at TIMESTAMPTZ,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      sound        TEXT    NOT NULL DEFAULT 'trading',
+      alert_type   TEXT    NOT NULL DEFAULT 'alert'
     )
   `);
 
   await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fired_at     TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS sound        TEXT NOT NULL DEFAULT 'trading'`);
+  await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS alert_type   TEXT NOT NULL DEFAULT 'alert'`);
   await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS fire_count   INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
@@ -64,9 +68,9 @@ export async function initDB() {
 
 export async function addAlert(alert) {
   const result = await pool.query(
-    `INSERT INTO alerts ("user", asset, condition, price)
-     VALUES ($1, $2, $3, $4) RETURNING *`,
-    [alert.user ?? "default", alert.asset, alert.condition, alert.price]
+    `INSERT INTO alerts ("user", asset, condition, price, sound, alert_type)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [alert.user ?? "default", alert.asset, alert.condition, alert.price, alert.sound ?? "trading", alert.alertType ?? "alert"]
   );
   return result.rows[0];
 }
