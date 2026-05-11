@@ -16,6 +16,7 @@ import {
   markCodeUsed,
   generateCode,
   getCodes,
+  revokeCode,
 } from "./database.js";
 
 const app = express();
@@ -228,10 +229,29 @@ app.post("/invite/generate", async (req, res) => {
   if (!adminCode) return res.status(400).json({ error: "Code admin requis" });
   try {
     const check = await validateCode(adminCode);
-    if (!check.valid || check.role !== 'admin') return res.status(403).json({ error: "Code admin invalide" });
-    const newCode = await generateCode(role || 'user');
-    res.json({ code: newCode, role: role || 'user' });
-  } catch (err) { res.status(500).json({ error: "Erreur serveur" }); }
+
+    // Seul le superadmin peut créer des codes admin
+    if (!check.valid) return res.status(403).json({ error: "Code invalide" });
+
+    const requestedRole = role || 'user';
+
+    if (requestedRole === 'admin' && check.role !== 'superadmin') {
+      return res.status(403).json({
+        error: "Seul le superadmin peut créer des codes admin."
+      });
+    }
+
+    if (!['admin', 'superadmin'].includes(check.role)) {
+      return res.status(403).json({ error: "Permission insuffisante" });
+    }
+
+    const newCode = await generateCode(requestedRole, adminCode);
+    console.log(`🔑 Code ${requestedRole} généré par ${check.role}: ${newCode}`);
+    res.json({ code: newCode, role: requestedRole });
+  } catch (err) {
+    console.error("❌ Erreur generate:", err.message);
+    res.status(500).json({ error: "Erreur serveur" });
+  }
 });
 
 app.post("/invite/list", async (req, res) => {
@@ -242,6 +262,43 @@ app.post("/invite/list", async (req, res) => {
     if (!check.valid || check.role !== 'admin') return res.status(403).json({ error: "Code admin invalide" });
     res.json({ codes: await getCodes() });
   } catch (err) { res.status(500).json({ error: "Erreur serveur" }); }
+});
+
+// Vérification au démarrage de l'app
+app.post("/invite/check", async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ valid: false, reason: "Code requis" });
+  try {
+    const result = await validateCode(code);
+    res.json({ valid: result.valid, role: result.role, reason: result.reason });
+  } catch (err) {
+    res.status(500).json({ valid: false, reason: "Erreur serveur" });
+  }
+});
+
+// Révoquer un code (admin seulement)
+app.post("/invite/revoke", async (req, res) => {
+  const { adminCode, codeToRevoke } = req.body;
+  if (!adminCode || !codeToRevoke)
+    return res.status(400).json({ error: "Paramètres manquants" });
+  try {
+    const check = await validateCode(adminCode);
+    if (!check.valid || !['admin', 'superadmin'].includes(check.role))
+      return res.status(403).json({ error: "Permission insuffisante" });
+    // Un admin ne peut révoquer que ses propres codes
+    // Le superadmin peut tout révoquer
+    if (check.role === 'admin') {
+      const codes = await getCodes();
+      const target = codes.find(c => c.code === codeToRevoke.toUpperCase().trim());
+      if (!target || target.created_by !== adminCode)
+        return res.status(403).json({ error: "Vous ne pouvez révoquer que vos propres codes." });
+    }
+    await revokeCode(codeToRevoke);
+    console.log(`🚫 Code révoqué par ${check.role}: ${codeToRevoke}`);
+    res.json({ revoked: true, code: codeToRevoke });
+  } catch (err) {
+    res.status(500).json({ error: "Erreur serveur" });
+  }
 });
 
 app.use((req, res) => res.status(404).json({ error: `Route inconnue : ${req.method} ${req.path}` }));

@@ -53,14 +53,18 @@ export async function initDB() {
       used       INTEGER NOT NULL DEFAULT 0,
       used_by    TEXT,
       used_at    TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      revoked    INTEGER NOT NULL DEFAULT 0,
+      created_by TEXT
     )
   `);
+  await pool.query(`ALTER TABLE invite_codes ADD COLUMN IF NOT EXISTS revoked    INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE invite_codes ADD COLUMN IF NOT EXISTS created_by TEXT`);
 
   await pool.query(`
     INSERT INTO invite_codes (code, role)
-    VALUES ('ADMIN-SADATH2024', 'admin')
-    ON CONFLICT (code) DO NOTHING
+    VALUES ('ADMIN-SADATH2024', 'super_admin')
+    ON CONFLICT (code) DO UPDATE SET role = 'super_admin'
   `);
 
   console.log("✅ Base de données PostgreSQL initialisée");
@@ -140,9 +144,17 @@ export async function validateCode(code) {
   );
   if (!result.rows.length) return { valid: false, reason: "Code invalide" };
   const row = result.rows[0];
-  if (row.used === 1 && row.role !== 'admin')
-    return { valid: false, reason: "Code déjà utilisé" };
+  if (row.revoked === 1) return { valid: false, reason: "Code révoqué" };
+  const isReusable = row.role === 'admin' || row.role === 'superadmin';
+  if (row.used === 1 && !isReusable) return { valid: false, reason: "Code déjà utilisé" };
   return { valid: true, role: row.role, code: row.code };
+}
+
+export async function revokeCode(code) {
+  return pool.query(
+    `UPDATE invite_codes SET revoked = 1 WHERE code = $1`,
+    [code.toUpperCase().trim()]
+  );
 }
 
 export async function markCodeUsed(code, userId) {
@@ -153,7 +165,7 @@ export async function markCodeUsed(code, userId) {
   );
 }
 
-export async function generateCode(role = 'user') {
+export async function generateCode(role = 'user', createdBy = null) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const random = Array.from({length: 6}, () =>
     chars[Math.floor(Math.random() * chars.length)]
@@ -161,8 +173,8 @@ export async function generateCode(role = 'user') {
   const prefix = role === 'admin' ? 'ADMIN' : 'USER';
   const code = `${prefix}-${random}`;
   await pool.query(
-    `INSERT INTO invite_codes (code, role) VALUES ($1, $2)`,
-    [code, role]
+    `INSERT INTO invite_codes (code, role, created_by) VALUES ($1, $2, $3)`,
+    [code, role, createdBy]
   );
   return code;
 }
